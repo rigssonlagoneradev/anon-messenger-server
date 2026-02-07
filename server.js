@@ -1,39 +1,76 @@
 import { WebSocketServer } from "ws";
+import fs from "fs";
 
-const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-const clients = new Map(); // publicKey -> ws
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocketServer({ port: PORT });
+
+const clients = new Map();        // userId -> ws
+const QUEUE_FILE = "./queue.json";
+let messageQueue = {};
+
+// Load persisted queue
+if (fs.existsSync(QUEUE_FILE)) {
+  try {
+    messageQueue = JSON.parse(fs.readFileSync(QUEUE_FILE));
+  } catch {
+    messageQueue = {};
+  }
+}
+
+function persistQueue() {
+  fs.writeFileSync(QUEUE_FILE, JSON.stringify(messageQueue));
+}
 
 wss.on("connection", ws => {
-  let userKey = null;
+  let userId = null;
 
   ws.on("message", msg => {
     let data;
-    try {
-      data = JSON.parse(msg);
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(msg); } catch { return; }
 
-    // User comes online
+    // User online
     if (data.type === "hello") {
-      userKey = data.publicKey;
-      clients.set(userKey, ws);
+      userId = data.publicKey;
+      clients.set(userId, ws);
+
+      // Deliver queued messages
+      if (messageQueue[userId]) {
+        messageQueue[userId].forEach(m => {
+          ws.send(JSON.stringify({
+            type: "relay",
+            from: m.from,
+            payload: m.payload
+          }));
+        });
+        delete messageQueue[userId];
+        persistQueue();
+      }
+
       broadcastOnline();
     }
 
-    // Relay request / accept / reject
-    if (data.type === "relay" && clients.has(data.to)) {
-      clients.get(data.to).send(JSON.stringify({
-        type: "relay",
-        from: userKey,
-        payload: data.payload
-      }));
+    // Relay message
+    if (data.type === "relay") {
+      const { to, payload } = data;
+
+      if (clients.has(to)) {
+        clients.get(to).send(JSON.stringify({
+          type: "relay",
+          from: userId,
+          payload
+        }));
+      } else {
+        // Queue offline
+        if (!messageQueue[to]) messageQueue[to] = [];
+        messageQueue[to].push({ from: userId, payload });
+        persistQueue();
+      }
     }
   });
 
   ws.on("close", () => {
-    if (userKey) {
-      clients.delete(userKey);
+    if (userId) {
+      clients.delete(userId);
       broadcastOnline();
     }
   });
@@ -41,12 +78,9 @@ wss.on("connection", ws => {
 
 function broadcastOnline() {
   const users = [...clients.keys()];
-  for (const ws of clients.values()) {
-    ws.send(JSON.stringify({
-      type: "online",
-      users
-    }));
-  }
+  clients.forEach(ws => {
+    ws.send(JSON.stringify({ type: "online", users }));
+  });
 }
 
-console.log("Server running");
+console.log("Server running on", PORT);
